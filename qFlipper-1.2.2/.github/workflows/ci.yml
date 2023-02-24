@@ -1,0 +1,151 @@
+name: 'CI'
+
+on: push
+
+jobs:
+  build_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup workspace
+        uses: AutoModality/action-clean@v1
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
+        with:
+          key: docker-cache-${{ hashFiles('docker/**') }}-{hash}
+          restore-keys: docker-cache-${{ hashFiles('docker/**') }}-
+
+      - name: Build docker image
+        uses: ./.github/actions/docker
+
+      - name: Build application in docker
+        run: docker build -t flipp ./docker/ && docker run --rm --privileged -v $(pwd):/project flipp /project/build_linux.sh
+
+      - name: Publish application
+        uses: actions/upload-artifact@v2
+        with:
+          name: qFlipper-x86_64.AppImage
+          path: |
+                ./build/qFlipper-x86_64.AppImage
+          if-no-files-found: error
+          retention-days: 1
+
+  build_mac:
+    runs-on: [self-hosted, ARM64, macOS]
+    env:
+      MAC_OS_KEYCHAIN_NAME: ${{ secrets.MAC_OS_KEYCHAIN_NAME }}
+      MAC_OS_KEYCHAIN_PASSWORD: ${{ secrets.MAC_OS_KEYCHAIN_PASSWORD }}
+      MAC_OS_SIGNING_KEY_ID: ${{ secrets.MAC_OS_SIGNING_KEY_ID }}
+      MAC_OS_SIGNING_BUNDLE_ID: ${{ secrets.MAC_OS_SIGNING_BUNDLE_ID }}
+      MAC_OS_SIGNING_ASC_PROVIDER: ${{ secrets.MAC_OS_SIGNING_ASC_PROVIDER }}
+      MAC_OS_SIGNING_USERNAME: ${{ secrets.MAC_OS_SIGNING_USERNAME }}
+      MAC_OS_SIGNING_PASSWORD: ${{ secrets.MAC_OS_SIGNING_PASSWORD }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Build application
+        run: ./build_mac.sh
+
+      - name: Publish application
+        uses: actions/upload-artifact@v2
+        with:
+          name: qflipper.dmg
+          path: |
+            ./build_mac/qflipper.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  build_windows:
+    runs-on: [self-hosted, X64, Windows]
+    env:
+        SIGNING_TOOL: ${{ secrets.WIN_SIGNING_TOOL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Build application
+        run: .\build_windows.bat
+
+      - name: Publish application
+        uses: actions/upload-artifact@v2
+        with:
+          name: qFlipperSetup-64bit.exe
+          path: |
+            .\build\qFlipperSetup-64bit.exe
+            .\build\qFlipper-64bit.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  upload:
+    name: Upload apps to storage
+    needs: [build_windows, build_mac, build_linux]
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: 'Make artifacts directory'
+        run: |
+          test -d artifacts && rm -rf artifacts || true
+          mkdir artifacts
+
+      - name: 'Generate tag suffix'
+        if: startsWith(github.ref, 'refs/tags/') == true
+        run: |
+          echo "REF=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
+          echo "SUFFIX=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
+
+      - name: 'Generate branch suffix'
+        if: startsWith(github.ref, 'refs/tags/') != true
+        run: |
+          echo "REF=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
+          echo "SUFFIX=$(git rev-parse --abbrev-ref HEAD | sed 's/\//_/g')-$(date +'%d%m%Y')-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - uses: actions/download-artifact@v2
+        with:
+          name: qFlipper-x86_64.AppImage
+      - uses: actions/download-artifact@v2
+        with:
+          name: qFlipperSetup-64bit.exe
+      - uses: actions/download-artifact@v2
+        with:
+          name: qflipper.dmg
+
+      - name: Rename app
+        run: |
+            mv qFlipper-x86_64.AppImage ./artifacts/qFlipper-x86_64-${SUFFIX}.AppImage
+            mv qFlipperSetup-64bit.exe ./artifacts/qFlipperSetup-64bit-${SUFFIX}.exe
+            mv qFlipper-64bit.zip ./artifacts/qFlipper-64bit-${SUFFIX}.zip
+            mv qflipper.dmg ./artifacts/qFlipper-${SUFFIX}.dmg
+
+      - name: Upload apps
+        uses: burnett01/rsync-deployments@5.1
+        with:
+          switches: -cvzr --delete --mkpath
+          path: artifacts/
+          remote_path: "${{ secrets.RSYNC_DEPLOY_BASE_PATH }}qFlipper/${REF}/"
+          remote_host: ${{ secrets.RSYNC_DEPLOY_HOST }}
+          remote_port: ${{ secrets.RSYNC_DEPLOY_PORT }}
+          remote_user: ${{ secrets.RSYNC_DEPLOY_USER }}
+          remote_key: ${{ secrets.RSYNC_DEPLOY_KEY }}
+
+      - name: 'Trigger update server reindex'
+        uses: wei/curl@master
+        with:
+          args: -X POST -F 'key=${{ secrets.REINDEX_KEY }}' ${{ secrets.REINDEX_URL }}
